@@ -1,9 +1,9 @@
-name: 4910 SSA 데일리 리포트
+name: ably-daily-report
 
 on:
   schedule:
-    - cron: '0 0 * * *'   # 매일 00:00 UTC = 09:00 KST
-  workflow_dispatch:        # 수동 실행 가능
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   run:
@@ -18,10 +18,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 패키지 설치
+      - name: install
         run: pip install -r requirements.txt
 
-      - name: 리포트 생성
+      - name: run
         env:
           AIRBRIDGE_TOKEN: ${{ secrets.AIRBRIDGE_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
