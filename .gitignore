@@ -1,0 +1,4 @@
+gcp_service_account.json
+*.csv
+*.xlsx
+__pycache__/
