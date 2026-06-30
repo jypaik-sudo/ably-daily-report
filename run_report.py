@@ -173,14 +173,21 @@ for tname in ws.tables:
 ws.sheet_state = "hidden"
 print(f"적재 완료: {n}행")
 
-# ── pivotCache refreshOnLoad=1 ─────────────────────────────────────
+# ── pivotCache + 슬라이서 보존 ────────────────────────────────────
 out_buf = io.BytesIO()
 wb.save(out_buf)
 out_bytes = out_buf.getvalue()
 
+# 소스 xlsx에서 openpyxl이 날리는 파일 목록 수집
+PRESERVE_PATTERNS = ('slicer', 'drawing', 'sharedStrings', 'metadata', 'calcChain', 'printerSettings')
+with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zsrc:
+    src_entries = {e.filename: zsrc.read(e.filename) for e in zsrc.infolist()
+                   if any(p in e.filename for p in PRESERVE_PATTERNS)}
+
 final_buf = io.BytesIO()
 with zipfile.ZipFile(io.BytesIO(out_bytes), 'r') as zin, \
      zipfile.ZipFile(final_buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+    written = set()
     for item in zin.infolist():
         data = zin.read(item.filename)
         if 'pivotCacheDefinition' in item.filename:
@@ -189,7 +196,17 @@ with zipfile.ZipFile(io.BytesIO(out_bytes), 'r') as zin, \
             if 'refreshOnLoad' not in xml:
                 xml = xml.replace('<pivotCacheDefinition ', '<pivotCacheDefinition refreshOnLoad="1" ', 1)
             data = xml.encode('utf-8')
+        # 소스의 원본 파일로 덮어쓰기 (슬라이서 등)
+        if item.filename in src_entries:
+            data = src_entries[item.filename]
         zout.writestr(item, data)
+        written.add(item.filename)
+    # 소스에만 있는 파일 추가 (slicerCaches 등)
+    for fname, data in src_entries.items():
+        if fname not in written:
+            zout.writestr(fname, data)
+            print(f"  보존: {fname}")
+
 final_bytes = final_buf.getvalue()
 
 # ── Drive 업로드 ───────────────────────────────────────────────────
