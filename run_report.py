@@ -1,49 +1,38 @@
 """
-4910 SSA 데일리 리포트 자동화
-- 매일 전일자 Airbridge 데이터를 Google Drive xlsx에 적재
+4910 SSA 데일리 리포트 자동화 (zipfile 직접 수정 방식 — 슬라이서 보존)
 """
 import io, json, time, zipfile, re, urllib.request, os
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 import pandas as pd
-import openpyxl
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# ── 설정 ──────────────────────────────────────────────────────────
 AB_TOKEN  = os.environ["AIRBRIDGE_TOKEN"]
 FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
 GCP_KEY   = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
 
 TARGET = (datetime.utcnow() + timedelta(hours=9) - timedelta(days=1)).strftime("%Y-%m-%d")
-print(f"적재 대상 날짜: {TARGET}")
+print(f"적재 대상: {TARGET}")
 
-# ── Google Drive 연결 ──────────────────────────────────────────────
+# ── Google Drive ──────────────────────────────────────────────────
 creds = service_account.Credentials.from_service_account_info(
-    GCP_KEY, scopes=["https://www.googleapis.com/auth/drive"]
-)
+    GCP_KEY, scopes=["https://www.googleapis.com/auth/drive"])
 drive = build("drive", "v3", credentials=creds)
 
-def list_drive_files():
-    return drive.files().list(
-        q=f"'{FOLDER_ID}' in parents and trashed=false",
-        fields="files(id,name,modifiedTime)",
-        orderBy="modifiedTime desc",
-        supportsAllDrives=True, includeItemsFromAllDrives=True
-    ).execute().get("files", [])
-
-# ── 최신 파일 찾기 ─────────────────────────────────────────────────
-files = list_drive_files()
+files = drive.files().list(
+    q=f"'{FOLDER_ID}' in parents and trashed=false",
+    fields="files(id,name)", orderBy="modifiedTime desc",
+    supportsAllDrives=True, includeItemsFromAllDrives=True
+).execute().get("files", [])
 src = files[0]
-print(f"소스 파일: {src['name']}")
+print(f"소스: {src['name']}")
 
-# 이미 오늘 날짜 파일이 있으면 스킵
-month_day = TARGET[5:].replace("-", ".")  # "06.25"
+month_day = f"{int(TARGET[5:7])}.{int(TARGET[8:10])}"
 if any(month_day in f["name"] for f in files):
     print(f"이미 {month_day} 파일 존재. 스킵.")
     exit(0)
 
-# ── 소스 다운로드 ──────────────────────────────────────────────────
 buf = io.BytesIO()
 dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=src["id"], supportsAllDrives=True))
 done = False
@@ -51,7 +40,7 @@ while not done: _, done = dl.next_chunk()
 xlsx_bytes = buf.getvalue()
 print(f"다운로드: {len(xlsx_bytes):,} bytes")
 
-# ── Airbridge API 데이터 추출 ──────────────────────────────────────
+# ── Airbridge ─────────────────────────────────────────────────────
 HEADERS = {"Authorization": f"Bearer {AB_TOKEN}", "Content-Type": "application/json"}
 BODY = {
     "groupBys": ["event_date","campaign","ad_group","ad_creative"],
@@ -74,7 +63,7 @@ with urllib.request.urlopen(urllib.request.Request(
     "https://api.airbridge.io/reports/api/v7/apps/4910/actuals/query",
     data=json.dumps(BODY).encode(), headers=HEADERS, method="POST"), timeout=15) as r:
     task_id = json.loads(r.read())["task"]["taskId"]
-print(f"Airbridge 쿼리: {task_id}")
+print(f"taskId: {task_id}")
 
 for _ in range(40):
     time.sleep(3)
@@ -83,8 +72,7 @@ for _ in range(40):
         headers=HEADERS), timeout=10) as r:
         status = json.loads(r.read())["task"]["status"]
     if status == "SUCCESS":
-        print("데이터 준비 완료")
-        break
+        print("SUCCESS"); break
     print(f"  대기 중... ({status})")
 
 with urllib.request.urlopen(urllib.request.Request(
@@ -97,128 +85,171 @@ csv_bytes = urllib.request.urlopen(s3_url, timeout=60).read()
 df = pd.read_csv(io.BytesIO(csv_bytes), encoding="utf-8-sig")
 df = df[df["Event Date"] == TARGET].reset_index(drop=True)
 n = len(df)
-print(f"추출 행수: {n}")
+print(f"데이터: {n}행")
 if n == 0:
-    print("데이터 없음. 종료.")
-    exit(0)
+    print("데이터 없음. 종료."); exit(0)
 
-# ── Excel 적재 ────────────────────────────────────────────────────
-print("Excel 로딩 중...")
-wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), keep_vba=False)
-ws = wb["RD"]
-ws.sheet_state = "visible"
+# ── ZIP 직접 수정 ─────────────────────────────────────────────────
+with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
+    wb_xml  = z.read("xl/workbook.xml").decode("utf-8")
+    wb_rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    sheets  = re.findall(r'name="([^"]+)"[^>]+r:id="([^"]+)"', wb_xml)
+    rels    = dict(re.findall(r'Id="([^"]+)"[^>]+Target="([^"]+)"', wb_rels))
 
-# 마지막 행 확인
-last_row = 1
-for r in range(ws.max_row, 1, -1):
-    if ws.cell(r, 9).value is not None:
-        last_row = r
-        break
-print(f"적재 시작 행: {last_row + 1}")
+    rd_rid   = next(rid for name, rid in sheets if name == "RD")
+    rd_file  = f"xl/{rels[rd_rid]}"
 
-# I열 날짜 서식 복사
-date_fmt = ws.cell(last_row, 9).number_format
-fmt_cache = {col: ws.cell(last_row, col).number_format for col in range(9, 26)}
+    rd_rels_file = rd_file.replace("/worksheets/sheet", "/worksheets/_rels/sheet").replace(".xml", ".xml.rels")
+    rd_rels_xml  = z.read(rd_rels_file).decode("utf-8")
+    tbl_match    = re.search(r'Type="[^"]*table[^"]*"[^>]+Target="([^"]+)"', rd_rels_xml)
+    tbl_rel      = tbl_match.group(1) if tbl_match else None
+    tbl_file     = tbl_rel.replace("../", "xl/") if tbl_rel else None
+    print(f"RD: {rd_file}, Table: {tbl_file}")
 
-TARGET_DT = datetime.strptime(TARGET, "%Y-%m-%d")
-CSV_COLS = [
-    "Event Date","Campaign","Ad Group","Ad Creative",
-    "Cost (Channel)","Impressions (Channel)","Clicks (Channel)",
-    "Opens (Web)","Sign-up (App+Web)","Installs (App)",
-    "First Installs (App)","COMPLETE_ORDER_DOMESTIC Users (App)",
-    "COMPLETE_ORDER_DOMESTIC Users (Web)","Order Complete (App+Web)",
-    "Revenue (App+Web)","Order Complete Users (Web)","Order Complete Users (App)",
-]
-STR_COLS = {"Campaign","Ad Group","Ad Creative"}
+    # sharedStrings
+    ss_xml     = z.read("xl/sharedStrings.xml").decode("utf-8")
+    ss_strings = []
+    for si in re.findall(r"<si>(.*?)</si>", ss_xml, re.DOTALL):
+        t = re.search(r"<t[^>]*>([^<]*)</t>", si)
+        ss_strings.append(t.group(1) if t else "")
+    ss_map      = {s: i for i, s in enumerate(ss_strings)}
+    new_strings = list(ss_strings)
 
-for i, row_data in df.iterrows():
-    excel_row = last_row + 1 + i
-    for col_idx, col_name in enumerate(CSV_COLS, start=9):
-        cell = ws.cell(excel_row, col_idx)
-        cell.number_format = fmt_cache[col_idx]
-        if col_name == "Event Date":
-            cell.value = TARGET_DT
-        elif col_name in STR_COLS:
-            v = row_data[col_name]
-            cell.value = str(v) if pd.notna(v) else ""
-        else:
-            v = row_data[col_name]
-            cell.value = float(v) if pd.notna(v) else 0.0
+    def get_ss_idx(text):
+        if text not in ss_map:
+            ss_map[text] = len(new_strings)
+            new_strings.append(text)
+        return ss_map[text]
 
-# A:H, Z 수식 복사
-FORMULA_COLS = list(range(1, 9)) + [26]
-formulas = {col: ws.cell(2, col).value for col in FORMULA_COLS}
-G_TMPL = "=IF(COUNTIF('운영 중인 그룹'!$B$2:$B$191,K{r})>0,\"Y\",\"N\")"
-H_TMPL = '=IFERROR(MID(L{r}, FIND("[", L{r})+1, FIND("]", L{r})-FIND("[", L{r})-1), "")'
+    rd_xml   = z.read(rd_file).decode("utf-8")
+    last_row = int(re.findall(r'<row r="(\d+)"', rd_xml)[-1])
+    print(f"마지막 행: {last_row}")
 
-first_new = last_row + 1
-new_last  = last_row + n
-for r in range(first_new, new_last + 1):
-    for col in FORMULA_COLS:
-        cell = ws.cell(r, col)
-        if col == 7:
-            cell.value = G_TMPL.format(r=r)
-        elif col == 8:
-            cell.value = H_TMPL.format(r=r)
-        else:
-            cell.value = formulas[col]
+    # 수식 템플릿 (row 2에서 추출)
+    sample_m = re.search(r'<row r="2"[^>]*>(.*?)</row>', rd_xml, re.DOTALL)
+    if not sample_m:
+        sample_m = re.search(r'<row r="\d+"[^>]*>(.*?)</row>', rd_xml, re.DOTALL)
+    sample_cells = sample_m.group(1) if sample_m else ""
 
-# 테이블 범위 확장
-for tname in ws.tables:
-    tbl = ws.tables[tname]
-    col_letters = ''.join(c for c in tbl.ref.split(":")[1] if c.isalpha())
-    tbl.ref = f"{tbl.ref.split(':')[0]}:{col_letters}{new_last}"
-    print(f"테이블 '{tname}' → {tbl.ref}")
+    def get_cell_template(cells_str, col):
+        m = re.search(rf'<c r="{col}\d+"((?:[^>])*?)>(.*?)</c>', cells_str, re.DOTALL)
+        return (m.group(1), m.group(2)) if m else (None, None)
 
-ws.sheet_state = "hidden"
-print(f"적재 완료: {n}행")
+    formula_cols = {col: get_cell_template(sample_cells, col) for col in ["A","B","C","D","E","F","Z"]}
 
-# ── pivotCache + 슬라이서 보존 ────────────────────────────────────
-out_buf = io.BytesIO()
-wb.save(out_buf)
-out_bytes = out_buf.getvalue()
+    # I열 날짜 스타일
+    i_m = re.search(r'<c r="I\d+"([^>]*)>', rd_xml)
+    i_s = re.search(r's="(\d+)"', i_m.group(1)) if i_m else None
+    date_style  = i_s.group(1) if i_s else "3"
+    excel_date  = (datetime.strptime(TARGET, "%Y-%m-%d") - datetime(1899, 12, 30)).days
 
-# 소스 xlsx에서 openpyxl이 날리는 파일 목록 수집
-PRESERVE_PATTERNS = ('slicer', 'drawing', 'sharedStrings', 'metadata', 'calcChain', 'printerSettings')
-with zipfile.ZipFile(io.BytesIO(xlsx_bytes), 'r') as zsrc:
-    src_entries = {e.filename: zsrc.read(e.filename) for e in zsrc.infolist()
-                   if any(p in e.filename for p in PRESERVE_PATTERNS)}
+    CSV_TEXT = [("J","Campaign"), ("K","Ad Group"), ("L","Ad Creative")]
+    CSV_NUM  = [
+        ("M","Cost (Channel)"), ("N","Impressions (Channel)"), ("O","Clicks (Channel)"),
+        ("P","Opens (Web)"), ("Q","Sign-up (App+Web)"), ("R","Installs (App)"),
+        ("S","First Installs (App)"), ("T","COMPLETE_ORDER_DOMESTIC Users (App)"),
+        ("U","COMPLETE_ORDER_DOMESTIC Users (Web)"), ("V","Order Complete (App+Web)"),
+        ("W","Revenue (App+Web)"), ("X","Order Complete Users (Web)"), ("Y","Order Complete Users (App)")
+    ]
 
-final_buf = io.BytesIO()
-with zipfile.ZipFile(io.BytesIO(out_bytes), 'r') as zin, \
-     zipfile.ZipFile(final_buf, 'w', zipfile.ZIP_DEFLATED) as zout:
-    written = set()
-    for item in zin.infolist():
-        data = zin.read(item.filename)
-        if 'pivotCacheDefinition' in item.filename:
-            xml = data.decode('utf-8')
-            xml = re.sub(r'refreshOnLoad="0"', 'refreshOnLoad="1"', xml)
-            if 'refreshOnLoad' not in xml:
-                xml = xml.replace('<pivotCacheDefinition ', '<pivotCacheDefinition refreshOnLoad="1" ', 1)
-            data = xml.encode('utf-8')
-        # 소스의 원본 파일로 덮어쓰기 (슬라이서 등)
-        if item.filename in src_entries:
-            data = src_entries[item.filename]
-        zout.writestr(item, data)
-        written.add(item.filename)
-    # 소스에만 있는 파일 추가 (slicerCaches 등)
-    for fname, data in src_entries.items():
-        if fname not in written:
-            zout.writestr(fname, data)
-            print(f"  보존: {fname}")
+    def xml_esc(s):
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-final_bytes = final_buf.getvalue()
+    rows_parts = []
+    for i, row_data in df.iterrows():
+        r = last_row + 1 + i
+        cells = []
 
-# ── Drive 업로드 ───────────────────────────────────────────────────
-# 파일명: 소스에서 날짜 부분 교체 (예: 6.24 → 6.25)
-src_month_day = src["name"][src["name"].rfind("_")+1:].replace(".xlsx","")  # "6.24"
-new_month_day = f"{int(TARGET[5:7])}.{int(TARGET[8:10])}"                   # "6.25"
-new_name = src["name"].replace(src_month_day, new_month_day)
+        # A-F: 구조적 참조 수식 (행번호 불변)
+        for col in ["A","B","C","D","E","F"]:
+            attrs, content = formula_cols[col]
+            if attrs is not None:
+                cells.append(f'<c r="{col}{r}"{attrs}>{content}</c>')
+
+        # G: 운영여부
+        cells.append(f'<c r="G{r}" s="8" t="str"><f>IF(COUNTIF(&apos;운영 중인 그룹&apos;!$B$2:$B$196,K{r})&gt;0,&quot;Y&quot;,&quot;N&quot;)</f></c>')
+
+        # H: 브랜드
+        cells.append(f'<c r="H{r}" s="8" t="str"><f>IFERROR(MID(L{r},FIND(&quot;[&quot;,L{r})+1,FIND(&quot;]&quot;,L{r})-FIND(&quot;[&quot;,L{r})-1),&quot;&quot;)</f></c>')
+
+        # I: 날짜
+        cells.append(f'<c r="I{r}" s="{date_style}"><v>{excel_date}</v></c>')
+
+        # J,K,L: 텍스트 (sharedString)
+        for col, csv_col in CSV_TEXT:
+            val = str(row_data.get(csv_col, ""))
+            val = "" if val == "nan" else val
+            idx = get_ss_idx(val)
+            cells.append(f'<c r="{col}{r}" t="s"><v>{idx}</v></c>')
+
+        # M-Y: 숫자
+        for col, csv_col in CSV_NUM:
+            val = row_data.get(csv_col, 0)
+            v   = 0.0 if str(val) == "nan" else float(val)
+            cells.append(f'<c r="{col}{r}"><v>{v}</v></c>')
+
+        # Z: 구조적 참조 수식
+        attrs, content = formula_cols["Z"]
+        if attrs is not None:
+            cells.append(f'<c r="Z{r}"{attrs}>{content}</c>')
+
+        rows_parts.append(f'<row r="{r}" spans="1:26" x14ac:dyDescent="0.6">{"".join(cells)}</row>')
+        if (i + 1) % 500 == 0:
+            print(f"  행 생성 {i+1}/{n}")
+
+    new_last    = last_row + n
+    new_rd_xml  = rd_xml.replace("</sheetData>", "".join(rows_parts) + "</sheetData>")
+
+    tbl_xml     = z.read(tbl_file).decode("utf-8") if tbl_file else ""
+    tbl_xml_new = re.sub(r'ref="([A-Z]+1:[A-Z]+)\d+"', rf'ref="\g<1>{new_last}"', tbl_xml) if tbl_xml else ""
+
+    ss_count  = len(new_strings)
+    ss_items  = "".join(f'<si><t xml:space="preserve">{xml_esc(s)}</t></si>' for s in new_strings)
+    new_ss    = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                 f'count="{ss_count}" uniqueCount="{ss_count}">{ss_items}</sst>')
+
+    wb_mod = wb_xml
+    if "fullCalcOnLoad" not in wb_mod:
+        wb_mod = re.sub(r'<calcPr([^/]*)/>', r'<calcPr\1 fullCalcOnLoad="1"/>', wb_mod)
+        if "calcPr" not in wb_mod:
+            wb_mod = wb_mod.replace("</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>')
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as zin, \
+         zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            fn = item.filename
+            if fn == "xl/calcChain.xml":
+                continue
+            elif fn == rd_file:
+                zout.writestr(item, new_rd_xml.encode("utf-8"))
+            elif tbl_file and fn == tbl_file:
+                zout.writestr(item, tbl_xml_new.encode("utf-8"))
+            elif fn == "xl/sharedStrings.xml":
+                zout.writestr(item, new_ss.encode("utf-8"))
+            elif fn == "xl/workbook.xml":
+                zout.writestr(item, wb_mod.encode("utf-8"))
+            elif "pivotCacheDefinition" in fn:
+                data = zin.read(fn).decode("utf-8")
+                data = re.sub(r'refreshOnLoad="0"', 'refreshOnLoad="1"', data)
+                if "refreshOnLoad" not in data:
+                    data = data.replace("<pivotCacheDefinition ", '<pivotCacheDefinition refreshOnLoad="1" ', 1)
+                zout.writestr(item, data.encode("utf-8"))
+            else:
+                zout.writestr(item, zin.read(fn))
+
+final_bytes = out.getvalue()
+print(f"최종 크기: {len(final_bytes):,} bytes")
+
+# ── 파일명 생성 ───────────────────────────────────────────────────
+src_name      = src["name"]
+src_month_day = src_name[src_name.rfind("_")+1:].replace(".xlsx","")
+new_name      = src_name.replace(src_month_day, month_day)
 print(f"업로드: {new_name}")
 
 media = MediaIoBaseUpload(io.BytesIO(final_bytes),
-    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    resumable=True)
+    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", resumable=True)
 uploaded = drive.files().create(
     body={"name": new_name, "parents": [FOLDER_ID]},
     media_body=media, fields="id,name",
