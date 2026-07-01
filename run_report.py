@@ -215,6 +215,19 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
         if "calcPr" not in wb_mod:
             wb_mod = wb_mod.replace("</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>')
 
+    def update_ilbyeol_slicer(sc_xml):
+        """일별 slicerCache: 새 날짜 x 인덱스 추가 + 마지막 항목만 선택"""
+        count_m = re.search(r'<items count="(\d+)"', sc_xml)
+        if not count_m:
+            return sc_xml
+        current_count = int(count_m.group(1))
+        new_x = current_count  # 새 날짜의 pivot cache 인덱스 (0-based)
+        new_count = current_count + 1
+        sc_xml = sc_xml.replace(' s="1"', '')                          # 기존 선택 해제
+        sc_xml = sc_xml.replace('</items>', f'<i x="{new_x}" s="1"/></items>')  # 새 날짜 선택
+        sc_xml = re.sub(r'<items count="\d+"', f'<items count="{new_count}"', sc_xml)
+        return sc_xml
+
     out = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as zin, \
          zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -235,6 +248,12 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
                 data = re.sub(r'refreshOnLoad="0"', 'refreshOnLoad="1"', data)
                 if "refreshOnLoad" not in data:
                     data = data.replace("<pivotCacheDefinition ", '<pivotCacheDefinition refreshOnLoad="1" ', 1)
+                zout.writestr(item, data.encode("utf-8"))
+            elif "xl/slicerCaches/" in fn:
+                data = zin.read(fn).decode("utf-8")
+                if 'sourceName="일별"' in data:  # sourceName="일별"
+                    data = update_ilbyeol_slicer(data)
+                    print(f"슬라이서 업데이트: {fn}")
                 zout.writestr(item, data.encode("utf-8"))
             else:
                 zout.writestr(item, zin.read(fn))
