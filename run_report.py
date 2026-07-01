@@ -242,10 +242,8 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
 final_bytes = out.getvalue()
 print(f"최종 크기: {len(final_bytes):,} bytes")
 
-# ── 파일명 생성 ───────────────────────────────────────────────────
-src_name      = src["name"]
-src_month_day = src_name[src_name.rfind("_")+1:].replace(".xlsx","")
-new_name      = src_name.replace(src_month_day, month_day)
+# ── 파일명 생성 (항상 고정 패턴: 4910_SSA_데일리리포트_M.D.xlsx) ──
+new_name = f"4910_SSA_데일리리포트_{month_day}.xlsx"
 print(f"업로드: {new_name}")
 
 media = MediaIoBaseUpload(io.BytesIO(final_bytes),
