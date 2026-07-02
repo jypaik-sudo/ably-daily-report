@@ -8,9 +8,10 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-AB_TOKEN  = os.environ["AIRBRIDGE_TOKEN"]
-FOLDER_ID = os.environ["DRIVE_FOLDER_ID"]
-GCP_KEY   = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+AB_TOKEN     = os.environ["AIRBRIDGE_TOKEN"]
+DEST_FOLDER  = os.environ["DRIVE_FOLDER_ID"]          # 업로드 대상 폴더
+SRC_FOLDER   = "1Vo4WHoVllXQA8CjYTPKVRb3g1tI3Td_O"   # 템플릿 소스 폴더
+GCP_KEY      = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
 
 TARGET = (datetime.utcnow() + timedelta(hours=9) - timedelta(days=1)).strftime("%Y-%m-%d")
 print(f"적재 대상: {TARGET}")
@@ -20,18 +21,26 @@ creds = service_account.Credentials.from_service_account_info(
     GCP_KEY, scopes=["https://www.googleapis.com/auth/drive"])
 drive = build("drive", "v3", credentials=creds)
 
-files = drive.files().list(
-    q=f"'{FOLDER_ID}' in parents and trashed=false",
-    fields="files(id,name)", orderBy="modifiedTime desc",
-    supportsAllDrives=True, includeItemsFromAllDrives=True
-).execute().get("files", [])
-src = files[0]
-print(f"소스: {src['name']}")
+def list_files(folder_id):
+    return drive.files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        fields="files(id,name)", orderBy="modifiedTime desc",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute().get("files", [])
 
+# 중복 확인: 목적지 폴더에 이미 오늘 날짜 파일이 있으면 스킵
 month_day = f"{int(TARGET[5:7])}.{int(TARGET[8:10])}"
-if any(month_day in f["name"] for f in files):
+dest_files = list_files(DEST_FOLDER)
+if any(month_day in f["name"] for f in dest_files):
     print(f"이미 {month_day} 파일 존재. 스킵.")
     exit(0)
+
+# 소스 폴더에서 가장 최근 파일 다운로드
+src_files = list_files(SRC_FOLDER)
+if not src_files:
+    print("소스 폴더에 파일 없음. 종료."); exit(1)
+src = src_files[0]
+print(f"소스: {src['name']}")
 
 buf = io.BytesIO()
 dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=src["id"], supportsAllDrives=True))
@@ -160,35 +169,26 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
         r = last_row + 1 + i
         cells = []
 
-        # A-F: 구조적 참조 수식 (행번호 불변)
         for col in ["A","B","C","D","E","F"]:
             attrs, content = formula_cols[col]
             if attrs is not None:
                 cells.append(f'<c r="{col}{r}"{attrs}>{content}</c>')
 
-        # G: 운영여부
         cells.append(f'<c r="G{r}" s="8" t="str"><f>IF(COUNTIF(&apos;운영 중인 그룹&apos;!$B$2:$B$196,K{r})&gt;0,&quot;Y&quot;,&quot;N&quot;)</f></c>')
-
-        # H: 브랜드
         cells.append(f'<c r="H{r}" s="8" t="str"><f>IFERROR(MID(L{r},FIND(&quot;[&quot;,L{r})+1,FIND(&quot;]&quot;,L{r})-FIND(&quot;[&quot;,L{r})-1),&quot;&quot;)</f></c>')
-
-        # I: 날짜
         cells.append(f'<c r="I{r}" s="{date_style}"><v>{excel_date}</v></c>')
 
-        # J,K,L: 텍스트 (sharedString)
         for col, csv_col in CSV_TEXT:
             val = str(row_data.get(csv_col, ""))
             val = "" if val == "nan" else val
             idx = get_ss_idx(val)
             cells.append(f'<c r="{col}{r}" t="s"><v>{idx}</v></c>')
 
-        # M-Y: 숫자
         for col, csv_col in CSV_NUM:
             val = row_data.get(csv_col, 0)
             v   = 0.0 if str(val) == "nan" else float(val)
             cells.append(f'<c r="{col}{r}"><v>{v}</v></c>')
 
-        # Z: 구조적 참조 수식
         attrs, content = formula_cols["Z"]
         if attrs is not None:
             cells.append(f'<c r="Z{r}"{attrs}>{content}</c>')
@@ -199,6 +199,8 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
 
     new_last    = last_row + n
     new_rd_xml  = rd_xml.replace("</sheetData>", "".join(rows_parts) + "</sheetData>")
+    # RD 시트 커서도 A1으로
+    new_rd_xml  = re.sub(r'<selection[^/]*/>', '<selection activeCell="A1" sqref="A1"/>', new_rd_xml)
 
     tbl_xml     = z.read(tbl_file).decode("utf-8") if tbl_file else ""
     tbl_xml_new = re.sub(r'ref="([A-Z]+1:[A-Z]+)\d+"', rf'ref="\g<1>{new_last}"', tbl_xml) if tbl_xml else ""
@@ -209,24 +211,28 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
                  f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
                  f'count="{ss_count}" uniqueCount="{ss_count}">{ss_items}</sst>')
 
+    # workbook.xml: fullCalcOnLoad + Summary를 activeTab으로 설정
     wb_mod = wb_xml
     if "fullCalcOnLoad" not in wb_mod:
         wb_mod = re.sub(r'<calcPr([^/]*)/>', r'<calcPr\1 fullCalcOnLoad="1"/>', wb_mod)
         if "calcPr" not in wb_mod:
             wb_mod = wb_mod.replace("</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>')
 
-    def update_ilbyeol_slicer(sc_xml):
-        """일별 slicerCache: 새 날짜 x 인덱스 추가 + 마지막 항목만 선택"""
-        count_m = re.search(r'<items count="(\d+)"', sc_xml)
-        if not count_m:
-            return sc_xml
-        current_count = int(count_m.group(1))
-        new_x = current_count  # 새 날짜의 pivot cache 인덱스 (0-based)
-        new_count = current_count + 1
-        sc_xml = sc_xml.replace(' s="1"', '')                          # 기존 선택 해제
-        sc_xml = sc_xml.replace('</items>', f'<i x="{new_x}" s="1"/></items>')  # 새 날짜 선택
-        sc_xml = re.sub(r'<items count="\d+"', f'<items count="{new_count}"', sc_xml)
-        return sc_xml
+    sheet_names = re.findall(r'<sheet\b[^>]*\bname="([^"]+)"', wb_mod)
+    summary_idx = next((i for i, n in enumerate(sheet_names) if n == "Summary"), 0)
+    print(f"Summary 탭 인덱스: {summary_idx} (전체 시트: {sheet_names})")
+    wb_mod = re.sub(r'(<workbookView\b[^>]*\b)activeTab="\d+"', rf'\1activeTab="{summary_idx}"', wb_mod)
+    if "activeTab" not in wb_mod:
+        wb_mod = re.sub(r'<workbookView\b', f'<workbookView activeTab="{summary_idx}"', wb_mod, count=1)
+
+    # 모든 worksheet 파일 목록 (RD 제외 → RD는 이미 new_rd_xml로 처리)
+    worksheet_files = {f"xl/{rels[rid]}" for _, rid in sheets}
+
+    def set_a1_cursor(xml_str):
+        """모든 <selection> 을 A1으로 초기화"""
+        xml_str = re.sub(r'<selection\b[^/]*/>', '<selection activeCell="A1" sqref="A1"/>', xml_str)
+        xml_str = re.sub(r'<selection\b[^>]*>.*?</selection>', '<selection activeCell="A1" sqref="A1"/>', xml_str, flags=re.DOTALL)
+        return xml_str
 
     out = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as zin, \
@@ -249,11 +255,9 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
                 if "refreshOnLoad" not in data:
                     data = data.replace("<pivotCacheDefinition ", '<pivotCacheDefinition refreshOnLoad="1" ', 1)
                 zout.writestr(item, data.encode("utf-8"))
-            elif "xl/slicerCaches/" in fn:
-                data = zin.read(fn).decode("utf-8")
-                if 'sourceName="일별"' in data:  # sourceName="일별"
-                    data = update_ilbyeol_slicer(data)
-                    print(f"슬라이서 업데이트: {fn}")
+            elif fn in worksheet_files and fn != rd_file:
+                # RD 외 모든 시트: 커서 A1 설정 (슬라이서 등 나머지는 그대로)
+                data = set_a1_cursor(zin.read(fn).decode("utf-8"))
                 zout.writestr(item, data.encode("utf-8"))
             else:
                 zout.writestr(item, zin.read(fn))
@@ -261,14 +265,13 @@ with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as z:
 final_bytes = out.getvalue()
 print(f"최종 크기: {len(final_bytes):,} bytes")
 
-# ── 파일명 생성 (항상 고정 패턴: 4910_SSA_데일리리포트_M.D.xlsx) ──
 new_name = f"4910_SSA_데일리리포트_{month_day}.xlsx"
 print(f"업로드: {new_name}")
 
 media = MediaIoBaseUpload(io.BytesIO(final_bytes),
     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", resumable=True)
 uploaded = drive.files().create(
-    body={"name": new_name, "parents": [FOLDER_ID]},
+    body={"name": new_name, "parents": [DEST_FOLDER]},
     media_body=media, fields="id,name",
     supportsAllDrives=True
 ).execute()
